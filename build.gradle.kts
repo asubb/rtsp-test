@@ -29,4 +29,5 @@ dependencies {
     implementation(kotlin("stdlib-jdk8"))
     implementation("io.github.microutils:kotlin-logging:1.7.7")
     implementation("ch.qos.logback:logback-classic:1.2.3")
+    implementation("io.netty:netty-all:4.1.52.Final")
 }
