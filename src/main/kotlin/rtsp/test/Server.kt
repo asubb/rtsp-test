@@ -17,11 +17,13 @@ import mu.KotlinLogging
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 
 var recording = AtomicBoolean(false)
-val fos = FileOutputStream(File("/users/asubb/tmp/output.wav").also { it.createNewFile() })
+var contentFile = File.createTempFile("some-file", ".wav.tmp")
+var stream: OutputStream? = null
 
 class Controller : ChannelInboundHandlerAdapter() {
     val log = KotlinLogging.logger { }
@@ -71,9 +73,16 @@ class Controller : ChannelInboundHandlerAdapter() {
                 }
                 RtspMethods.RECORD -> {
                     recording.set(true)
+                    stream = FileOutputStream(contentFile)
+                    log.info { "Started streaming to temporary file $contentFile" }
                 }
                 RtspMethods.TEARDOWN -> {
-
+                    log.info { "Finished streaming to temporary file $contentFile" }
+                    stream?.close()
+                    val ba = contentFile.readBytes()
+                    val f = File.createTempFile("stream", ".wav")
+                    f.writeBytes(WavHeader(BitDepth.BIT_16, 44100.0f, 1, ba.size).header() + ba)
+                    log.info { "Saved output to file $f" }
                 }
                 else -> throw UnsupportedOperationException()
             }
@@ -148,15 +157,28 @@ class Receiver : ChannelInboundHandlerAdapter() {
                         }
                         4 -> {
                             if (bytesLeftToRead > 0) {
-                                currentBuffer[currentPacketSize - bytesLeftToRead--] = bytes[i]
+                                currentBuffer[currentPacketSize - bytesLeftToRead] = bytes[i]
+                                bytesLeftToRead--
                             }
                             if (bytesLeftToRead == 0) {
                                 log.info {
                                     "Read the packet of channel=$currentChannel, bytesInThePacket=$currentPacketSize:\n" +
-                                            currentBuffer.mapIndexed { index, byte ->
-                                                (byte.toInt() and 0xFF).toString(16).padStart(2, '0') +
-                                                        if ((index + 1) % 10 == 0) "\n" else " "
-                                            }.joinToString("")
+                                            currentBuffer.asSequence().windowed(16, 16, true)
+                                                    .map { bytes ->
+                                                        bytes.joinToString(" ") { byte ->
+                                                            (byte.toInt() and 0xFF).toString(16).padStart(2, '0')
+                                                        } + "|" +
+                                                                bytes.map { byte ->
+                                                                    if (byte in 0x20..0xCF) byte.toChar() else '.'
+                                                                }.joinToString("") + "|"
+
+                                                    }.joinToString("\n")
+                                }
+                                if (currentChannel == 0) {
+                                    stream?.write(currentBuffer
+                                            .copyOfRange(12, currentBuffer.size) // ???? why??
+                                    )
+                                    stream?.flush()
                                 }
                                 currentState = 0
                             }
@@ -191,7 +213,7 @@ fun main() {
 
                     override fun initChannel(ch: SocketChannel) {
                         ch.pipeline()
-                                .addLast(LoggingHandler())
+//                                .addLast(LoggingHandler())
                                 .addLast(Receiver())
                                 .addLast(RtspDecoder())
                                 .addLast(HttpObjectAggregator(4 * 1024))
