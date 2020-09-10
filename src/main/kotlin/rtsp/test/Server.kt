@@ -2,6 +2,7 @@ package rtsp.test
 
 import io.netty.bootstrap.ServerBootstrap
 import io.netty.buffer.ByteBuf
+import io.netty.buffer.Unpooled
 import io.netty.channel.*
 import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.SocketChannel
@@ -11,6 +12,7 @@ import io.netty.handler.codec.http.FullHttpRequest
 import io.netty.handler.codec.http.HttpContent
 import io.netty.handler.codec.http.HttpObjectAggregator
 import io.netty.handler.codec.rtsp.*
+import io.netty.handler.logging.LoggingHandler
 import mu.KotlinLogging
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -51,10 +53,27 @@ class Controller : ChannelInboundHandlerAdapter() {
                     log.info { "Announced the following content $content" }
                 }
                 RtspMethods.SETUP -> {
-                    response.headers().add(RtspHeaderNames.TRANSPORT, msg.headers()[RtspHeaderNames.TRANSPORT])
+                    val transport = msg.headers()[RtspHeaderNames.TRANSPORT]
+                    val values = transport.split(";")
+                    if (values[0] != "RTP/AVP/TCP") throw UnsupportedOperationException("Only TCP is supported")
+                    if (values[1] != "unicast") throw UnsupportedOperationException("Only `unicast` is supported")
+                    val mode = values.firstOrNull { it.startsWith("mode") }
+                            ?.split("=", limit = 2)
+                            ?.get(1)
+                    val interleaved = values.firstOrNull { it.startsWith("interleaved") }
+                            ?.split("=", limit = 2)
+                            ?.get(1)
+                            ?: throw UnsupportedOperationException("interleaved must be specified")
+
+                    if (mode?.toLowerCase() != "record") throw UnsupportedOperationException("mode=$mode is not supported")
+
+                    response.headers().add(RtspHeaderNames.TRANSPORT, transport)
                 }
                 RtspMethods.RECORD -> {
                     recording.set(true)
+                }
+                RtspMethods.TEARDOWN -> {
+
                 }
                 else -> throw UnsupportedOperationException()
             }
@@ -75,6 +94,18 @@ class Controller : ChannelInboundHandlerAdapter() {
     }
 }
 
+var bytesLeftToRead: Int = 0
+var currentBuffer: ByteArray = ByteArray(0)
+var currentChannel: Int = 0
+var currentPacketSize: Int = 0
+
+// 0 - searching for the packet,
+// 1 - waiting for the channel,
+// 2 - waiting for the packet size byte 0,
+// 3 - waiting for the packet size byte 1,
+// 4 - reading the buffer
+var currentState: Int = 0
+
 class Receiver : ChannelInboundHandlerAdapter() {
 
     private val log = KotlinLogging.logger { }
@@ -86,10 +117,56 @@ class Receiver : ChannelInboundHandlerAdapter() {
         } else if (msg is ByteBuf) {
             val buffer = ByteArrayOutputStream()
             msg.readBytes(buffer, msg.readableBytes())
-            fos.write(buffer.toByteArray())
-            fos.flush()
-            msg.release()
-            ctx.fireChannelReadComplete()
+            val bytes = buffer.toByteArray()
+            var i = 0
+            if (bytes.copyOfRange(0, 8).contentEquals("TEARDOWN".toByteArray())) {
+                log.info { "Got TEARDOWN command. Escalating" }
+                recording.set(false)
+                ctx.fireChannelRead(Unpooled.copiedBuffer(bytes))
+            } else {
+                msg.release()
+                ctx.fireChannelReadComplete()
+                while (i < bytes.size) {
+                    when (currentState) {
+                        0 -> {
+                            if (bytes[i] == '$'.toByte()) currentState++
+                        }
+                        1 -> {
+                            currentChannel = bytes[i].toInt() and 0xFF
+                            currentState++
+                        }
+                        2 -> {
+                            currentPacketSize = (bytes[i].toInt() and 0xFF) shl 8
+                            currentState++
+                        }
+                        3 -> {
+                            currentPacketSize = currentPacketSize or (bytes[i].toInt() and 0xFF)
+                            currentState++
+                            log.info { "Located packet of channel=$currentChannel, bytesInThePacket=$currentPacketSize." }
+                            currentBuffer = ByteArray(currentPacketSize)
+                            bytesLeftToRead = currentPacketSize
+                        }
+                        4 -> {
+                            if (bytesLeftToRead > 0) {
+                                currentBuffer[currentPacketSize - bytesLeftToRead--] = bytes[i]
+                            }
+                            if (bytesLeftToRead == 0) {
+                                log.info {
+                                    "Read the packet of channel=$currentChannel, bytesInThePacket=$currentPacketSize:\n" +
+                                            currentBuffer.mapIndexed { index, byte ->
+                                                (byte.toInt() and 0xFF).toString(16).padStart(2, '0') +
+                                                        if ((index + 1) % 10 == 0) "\n" else " "
+                                            }.joinToString("")
+                                }
+                                currentState = 0
+                            }
+                        }
+                        else -> throw UnsupportedOperationException("state=$currentState")
+                    }
+                    i++
+                }
+                log.info { "Finished the buffer with state=$currentState, bytesLeftToRead=$bytesLeftToRead" }
+            }
         } else {
             throw UnsupportedOperationException()
         }
@@ -114,7 +191,7 @@ fun main() {
 
                     override fun initChannel(ch: SocketChannel) {
                         ch.pipeline()
-//                                .addLast(LoggingHandler())
+                                .addLast(LoggingHandler())
                                 .addLast(Receiver())
                                 .addLast(RtspDecoder())
                                 .addLast(HttpObjectAggregator(4 * 1024))
