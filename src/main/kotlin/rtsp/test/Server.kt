@@ -11,7 +11,6 @@ import io.netty.handler.codec.http.FullHttpRequest
 import io.netty.handler.codec.http.HttpContent
 import io.netty.handler.codec.http.HttpObjectAggregator
 import io.netty.handler.codec.rtsp.*
-import io.netty.handler.logging.LoggingHandler
 import mu.KotlinLogging
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -22,9 +21,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 var recording = AtomicBoolean(false)
 val fos = FileOutputStream(File("/users/asubb/tmp/output.wav").also { it.createNewFile() })
 
-class MyServerHandler : ChannelInboundHandlerAdapter() {
+class Controller : ChannelInboundHandlerAdapter() {
     val log = KotlinLogging.logger { }
-    override fun channelRead(ctx: ChannelHandlerContext, msg: Any) { // (2)
+    override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         log.info { "Received $msg" }
         if (msg is FullHttpRequest) {
             log.info { "Handling method ${msg.method()} on ${msg.uri()}" }
@@ -77,7 +76,9 @@ class MyServerHandler : ChannelInboundHandlerAdapter() {
 }
 
 class Receiver : ChannelInboundHandlerAdapter() {
-    val log = KotlinLogging.logger { }
+
+    private val log = KotlinLogging.logger { }
+
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         log.info { "Received $msg" }
         if (!recording.get()) {
@@ -92,6 +93,12 @@ class Receiver : ChannelInboundHandlerAdapter() {
         } else {
             throw UnsupportedOperationException()
         }
+    }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        // Close the connection when an exception is raised.
+        log.error(cause) { "Error in $ctx" }
+        ctx.close()
     }
 }
 
@@ -112,7 +119,7 @@ fun main() {
                                 .addLast(RtspDecoder())
                                 .addLast(HttpObjectAggregator(4 * 1024))
                                 .addLast(RtspEncoder())
-                                .addLast(MyServerHandler())
+                                .addLast(Controller())
                     }
                 })
                 .option(ChannelOption.SO_BACKLOG, 128)
