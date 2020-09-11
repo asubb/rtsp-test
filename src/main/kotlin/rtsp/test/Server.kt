@@ -167,16 +167,60 @@ class Receiver : ChannelInboundHandlerAdapter() {
                                                     .map { bytes ->
                                                         bytes.joinToString(" ") { byte ->
                                                             (byte.toInt() and 0xFF).toString(16).padStart(2, '0')
-                                                        } + "|" +
+                                                        }.padEnd(16 * 3 - 1, ' ') + "|" +
                                                                 bytes.map { byte ->
                                                                     if (byte in 0x20..0xCF) byte.toChar() else '.'
-                                                                }.joinToString("") + "|"
+                                                                }.joinToString("").padEnd(16, ' ') + "|"
 
                                                     }.joinToString("\n")
                                 }
+                                // read RTP header: https://tools.ietf.org/html/rfc3550#section-5.1
+                                val i1 = currentBuffer.take(4)
+                                        .mapIndexed { j, b -> (b.toLong() and 0xFF) shl (8 * (3 - j)) }
+                                        .reduce { acc, j -> acc or j }
+                                val version = (i1 ushr 30) and 0x03
+                                require(version == 2L) { "RTPHeader.version=$version. Version 2 is supported only." }
+                                val padding = (i1 ushr 29) and 0x01
+                                val extension = (i1 ushr 28) and 0x01
+                                require(extension == 0L) { "RTPHeader.extension=$extension. Non-0 value is not implemented." }
+                                val csrcCount = (i1 ushr 24) and 0x07
+                                require(csrcCount == 0L) { "RTPHeader.csrcCount=$csrcCount. Non-0 is not implemented." }
+                                val marker = (i1 ushr 23) and 0x01
+//                                require(marker == 0L) { "RTPHeader.marker=$marker. Non-0 value is not implemented." }
+                                val payload = (i1 ushr 16) and 0x7F
+                                val sequenceNumber = i1 and 0xFFFF
+                                val timestamp = currentBuffer.drop(4).take(4)
+                                        .mapIndexed { j, b -> (b.toLong() and 0xFF) shl (8 * (3 - j)) }
+                                        .reduce { acc, j -> acc or j }
+                                val ssrc = currentBuffer.drop(8).take(4)
+                                        .mapIndexed { j, b -> (b.toLong() and 0xFF) shl (8 * (3 - j)) }
+                                        .reduce { acc, j -> acc or j }
+                                val csrc = (0 until csrcCount).map {
+                                    currentBuffer.drop(12 + 4 * i).take(4)
+                                            .mapIndexed { j, b -> (b.toLong() and 0xFF) shl (8 * (3 - j)) }
+                                            .reduce { acc, j -> acc or j }
+                                }
+
+                                log.info {
+                                    """
+                                        RTP Header:
+                                            version=$version
+                                            padding=$padding
+                                            extension=$extension
+                                            csrcCount=$csrcCount
+                                            marker=$marker
+                                            payload=$payload
+                                            sequenceNumber=$sequenceNumber
+                                            timestamp=$timestamp
+                                            ssrc=$ssrc
+                                            csrc=$csrc
+                                    """.trimIndent()
+                                }
+
+                                val rtpHeaderSize = 12 + csrcCount.toInt()
                                 if (currentChannel == 0) {
                                     stream?.write(currentBuffer
-                                            .copyOfRange(12, currentBuffer.size) // ???? why??
+                                            .copyOfRange(rtpHeaderSize, currentBuffer.size) // ???? why??
                                     )
                                     stream?.flush()
                                 }

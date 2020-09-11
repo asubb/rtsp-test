@@ -19,3 +19,4 @@ OPTIONS -> ANNOUNCE -> SETUP -> RECORD -> byte stream
 ## Links
 
 * [RFC 2326: RTSP](https://tools.ietf.org/html/rfc2326)
+* [RFC 3550: RTP](https://tools.ietf.org/html/rfc3550)
