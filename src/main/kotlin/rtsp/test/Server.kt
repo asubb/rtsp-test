@@ -12,7 +12,6 @@ import io.netty.handler.codec.http.FullHttpRequest
 import io.netty.handler.codec.http.HttpContent
 import io.netty.handler.codec.http.HttpObjectAggregator
 import io.netty.handler.codec.rtsp.*
-import io.netty.handler.logging.LoggingHandler
 import mu.KotlinLogging
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -24,6 +23,23 @@ import java.util.concurrent.atomic.AtomicBoolean
 var recording = AtomicBoolean(false)
 var contentFile = File.createTempFile("some-file", ".wav.tmp")
 var stream: OutputStream? = null
+var dataChannel: Int? = null
+var manageChannel: Int? = null
+
+data class MediaAnnouncement(
+        val media: String,
+        val port: Int,
+        val numberOfPorts: Int,
+        val transport: String,
+        val fmtList: List<Int>
+)
+
+data class RtpMap(
+        val payloadType: Int,
+        val encoding: String,
+        val clockRate: Int,
+        val encodingParameters: String?
+)
 
 class Controller : ChannelInboundHandlerAdapter() {
     val log = KotlinLogging.logger { }
@@ -41,8 +57,9 @@ class Controller : ChannelInboundHandlerAdapter() {
                                     RtspMethods.DESCRIBE,
                                     RtspMethods.SETUP,
                                     RtspMethods.TEARDOWN,
-                                    RtspMethods.PLAY,
-                                    RtspMethods.PAUSE,
+                                    RtspMethods.RECORD,
+                                    RtspMethods.ANNOUNCE,
+                                    RtspMethods.OPTIONS,
                             ).joinToString(", ")
                     )
                 }
@@ -52,7 +69,46 @@ class Controller : ChannelInboundHandlerAdapter() {
                     val content = String(buffer.toByteArray())
                             .split("\r\n")
                             .filterNot { it.isEmpty() }
-                    log.info { "Announced the following content $content" }
+                    log.info { "Announced the following content:\n${content.joinToString("\n")}" }
+
+                    // search for media name and transport address
+                    require(content.single { it.startsWith("v=") } == "v=0") { "Only version 0 is supported" }
+                    val announced = content.filter { it.startsWith("m=") }
+                            .map { mediaAnnouncementString ->
+                                val d = mediaAnnouncementString.removePrefix("m=").split(" ")
+                                require(d.size >= 4) { "The Media Announcement `$mediaAnnouncementString` doesn't have all expected elements (>=4)." }
+                                val media = d[0]
+                                val (port, portNumber) = if (d[1].indexOf('/') < 0) {
+                                    listOf(d[1].toInt(), 1)
+                                } else {
+                                    d[1].split("/", limit = 2).map { it.toInt() }
+                                }
+                                val transport = d[2]
+                                val fmtList = d.subList(3, d.size).map { it.toInt() }
+                                MediaAnnouncement(media, port, portNumber, transport, fmtList)
+                            }
+
+                    log.info { "Announced media: $announced" }
+
+                    val rtpMaps = content.filter { it.startsWith("a=rtpmap:") }
+                            .map { rtpMapString ->
+                                val (payloadType, format) = rtpMapString.removePrefix("a=rtpmap:")
+                                        .split(" ", limit = 2)
+                                        .let { Pair(it[0].toInt(), it[1]) }
+                                val (encoding, clockRate, encodingParameters) = format.split("/")
+                                        .let { Triple(it[0], it[1].toInt(), if (it.size > 2) it[2] else null) }
+                                RtpMap(payloadType, encoding, clockRate, encodingParameters)
+                            }
+                    log.info { "RTP mappings: $rtpMaps" }
+
+                    // find all mappings for media
+                    announced.map {
+                        require(it.fmtList.size == 1) { "fmtList != 1 is not supported" }
+                        val fmt = it.fmtList.first()
+                        require(fmt >= 96) { "Built in formats are not supported, only custom >= 96" }
+                        checkNotNull(rtpMaps.firstOrNull { it.payloadType == fmt }) { "Format $fmt is not found among mappings: $rtpMaps" }
+                        TODO()
+                    }
                 }
                 RtspMethods.SETUP -> {
                     val transport = msg.headers()[RtspHeaderNames.TRANSPORT]
@@ -66,7 +122,9 @@ class Controller : ChannelInboundHandlerAdapter() {
                             ?.split("=", limit = 2)
                             ?.get(1)
                             ?: throw UnsupportedOperationException("interleaved must be specified")
-
+                    val (data, manage) = interleaved.split("-", limit = 2).map { it.toInt() }
+                    dataChannel = data
+                    manageChannel = manage
                     if (mode?.toLowerCase() != "record") throw UnsupportedOperationException("mode=$mode is not supported")
 
                     response.headers().add(RtspHeaderNames.TRANSPORT, transport)
@@ -218,7 +276,7 @@ class Receiver : ChannelInboundHandlerAdapter() {
                                 }
 
                                 val rtpHeaderSize = 12 + csrcCount.toInt()
-                                if (currentChannel == 0) {
+                                if (currentChannel == dataChannel) {
                                     stream?.write(currentBuffer
                                             .copyOfRange(rtpHeaderSize, currentBuffer.size) // ???? why??
                                     )

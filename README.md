@@ -12,11 +12,22 @@ ffmpeg -re -stream_loop -1 -i my.wav -rtsp_transport tcp -c copy -f rtsp rtsp://
 
 Very helpful might be to enable tracing logging by adding flag `-loglevel trace`
 
+Though `ffmpeg` utility doesn't send the `rtpmap` attribute during announcement phase. That means it should be done manually, but didn't figure out how at the moment. Dead end :(
+
+## Playing around with gstreamer
+
+Another great tool to play with is [gstreamer](https://gstreamer.freedesktop.org/). To stream the file specify the following pipeline:
+
+```bash
+gst-launch-1.0 -v filesrc location=my.wav ! decodebin ! audioconvert ! rtspclientsink location=rtsp://127.0.0.1:12345 protocols=tcp debug=true
+```
+
 ## Record process
 
-OPTIONS -> ANNOUNCE -> SETUP -> RECORD -> byte stream
+`[ OPTIONS ]` -> `ANNOUNCE` -> `SETUP` -> `RECORD` -> RTP byte stream
 
 ## Links
 
 * [RFC 2326: RTSP](https://tools.ietf.org/html/rfc2326)
 * [RFC 3550: RTP](https://tools.ietf.org/html/rfc3550)
+* [RFC 2327: Session Description Protocol](https://tools.ietf.org/html/rfc2327)
