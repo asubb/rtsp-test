@@ -17,6 +17,8 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 
@@ -25,6 +27,8 @@ var contentFile = File.createTempFile("some-file", ".wav.tmp")
 var stream: OutputStream? = null
 var dataChannel: Int? = null
 var manageChannel: Int? = null
+var channelMappings: Map<Int, RtpMap>? = null
+var clientLastSeen: Long = Long.MAX_VALUE
 
 data class MediaAnnouncement(
         val media: String,
@@ -42,7 +46,19 @@ data class RtpMap(
 )
 
 class Controller : ChannelInboundHandlerAdapter() {
+
     val log = KotlinLogging.logger { }
+    val sched = Executors.newSingleThreadScheduledExecutor()
+
+    init {
+        sched.scheduleAtFixedRate({
+            if (System.currentTimeMillis() - clientLastSeen > 5000) {
+                doTearDown()
+                sched.shutdownNow()
+            }
+        }, 0, 500, TimeUnit.MILLISECONDS)
+    }
+
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         log.info { "Received $msg" }
         if (msg is FullHttpRequest) {
@@ -102,13 +118,14 @@ class Controller : ChannelInboundHandlerAdapter() {
                     log.info { "RTP mappings: $rtpMaps" }
 
                     // find all mappings for media
-                    announced.map {
+                    channelMappings = announced.map {
                         require(it.fmtList.size == 1) { "fmtList != 1 is not supported" }
                         val fmt = it.fmtList.first()
                         require(fmt >= 96) { "Built in formats are not supported, only custom >= 96" }
-                        checkNotNull(rtpMaps.firstOrNull { it.payloadType == fmt }) { "Format $fmt is not found among mappings: $rtpMaps" }
-                        TODO()
-                    }
+                        val rtmMap = checkNotNull(rtpMaps.firstOrNull { it.payloadType == fmt }) { "Format $fmt is not found among mappings: $rtpMaps" }
+
+                        it.port to rtmMap
+                    }.toMap()
                 }
                 RtspMethods.SETUP -> {
                     val transport = msg.headers()[RtspHeaderNames.TRANSPORT]
@@ -135,12 +152,7 @@ class Controller : ChannelInboundHandlerAdapter() {
                     log.info { "Started streaming to temporary file $contentFile" }
                 }
                 RtspMethods.TEARDOWN -> {
-                    log.info { "Finished streaming to temporary file $contentFile" }
-                    stream?.close()
-                    val ba = contentFile.readBytes()
-                    val f = File.createTempFile("stream", ".wav")
-                    f.writeBytes(WavHeader(BitDepth.BIT_16, 44100.0f, 1, ba.size).header() + ba)
-                    log.info { "Saved output to file $f" }
+                    doTearDown()
                 }
                 else -> throw UnsupportedOperationException()
             }
@@ -152,6 +164,23 @@ class Controller : ChannelInboundHandlerAdapter() {
         } else {
             throw UnsupportedOperationException()
         }
+    }
+
+    private fun doTearDown() {
+        log.info { "Finished streaming to temporary file $contentFile" }
+        stream?.close()
+        val ba = contentFile.readBytes()
+        val f = File.createTempFile("stream", ".wav")
+        val mapping = checkNotNull(channelMappings?.get(dataChannel))
+        val bitDepth = when (mapping.encoding.toLowerCase()) {
+            "l8" -> BitDepth.BIT_8
+            "l16" -> BitDepth.BIT_16
+            else -> throw UnsupportedOperationException(mapping.encoding)
+        }
+        val sampleRate = mapping.clockRate.toFloat()
+        val channels = mapping.encodingParameters?.toInt() ?: 1
+        f.writeBytes(WavHeader(bitDepth, sampleRate, channels, ba.size).header() + ba)
+        log.info { "Saved output to file $f" }
     }
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
@@ -277,6 +306,7 @@ class Receiver : ChannelInboundHandlerAdapter() {
 
                                 val rtpHeaderSize = 12 + csrcCount.toInt()
                                 if (currentChannel == dataChannel) {
+                                    clientLastSeen = System.currentTimeMillis()
                                     stream?.write(currentBuffer
                                             .copyOfRange(rtpHeaderSize, currentBuffer.size) // ???? why??
                                     )
@@ -289,7 +319,7 @@ class Receiver : ChannelInboundHandlerAdapter() {
                     }
                     i++
                 }
-                log.info { "Finished the buffer with state=$currentState, bytesLeftToRead=$bytesLeftToRead" }
+//                log.info { "Finished the buffer with state=$currentState, bytesLeftToRead=$bytesLeftToRead" }
             }
         } else {
             throw UnsupportedOperationException()

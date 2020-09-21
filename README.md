@@ -22,9 +22,11 @@ Another great tool to play with is [gstreamer](https://gstreamer.freedesktop.org
 gst-launch-1.0 -v filesrc location=my.wav ! decodebin ! audioconvert ! rtspclientsink location=rtsp://127.0.0.1:12345 protocols=tcp debug=true
 ```
 
+Unfortunately `gstreamer` seems have a [bug](https://gitlab.freedesktop.org/gstreamer/gst-rtsp-server/-/issues/88) that prevents him from sending `TEARDOWN` signal, hence the server may detect the end of the stream only when connection broken.
+
 ## Record process
 
-`[ OPTIONS ]` -> `ANNOUNCE` -> `SETUP` -> `RECORD` -> RTP byte stream
+`[ OPTIONS ]` -> `ANNOUNCE` -> `SETUP` -> `RECORD` -> RTP byte stream -> `[ TEARDOWN ]` or broken connection
 
 ## Links
 
