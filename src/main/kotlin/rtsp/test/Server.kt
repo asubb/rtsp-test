@@ -83,8 +83,8 @@ class Controller : ChannelInboundHandlerAdapter() {
                     val buffer = ByteArrayOutputStream()
                     msg.content().readBytes(buffer, msg.content().readableBytes())
                     val content = String(buffer.toByteArray())
-                            .split("\r\n")
-                            .filterNot { it.isEmpty() }
+                            .split("[\r\n]+".toRegex())
+                            .filterNot(String::isEmpty)
                     log.info { "Announced the following content:\n${content.joinToString("\n")}" }
 
                     // search for media name and transport address
@@ -308,7 +308,7 @@ class Receiver : ChannelInboundHandlerAdapter() {
                                 if (currentChannel == dataChannel) {
                                     clientLastSeen = System.currentTimeMillis()
                                     stream?.write(currentBuffer
-                                            .copyOfRange(rtpHeaderSize, currentBuffer.size) // ???? why??
+                                            .copyOfRange(rtpHeaderSize, currentBuffer.size)
                                     )
                                     stream?.flush()
                                 }
@@ -319,7 +319,7 @@ class Receiver : ChannelInboundHandlerAdapter() {
                     }
                     i++
                 }
-//                log.info { "Finished the buffer with state=$currentState, bytesLeftToRead=$bytesLeftToRead" }
+                log.info { "Finished the buffer with state=$currentState, bytesLeftToRead=$bytesLeftToRead" }
             }
         } else {
             throw UnsupportedOperationException()
@@ -334,6 +334,10 @@ class Receiver : ChannelInboundHandlerAdapter() {
 }
 
 fun main() {
+    runServer()
+}
+
+fun runServer(port: Int = 12345) {
     val bossGroup: EventLoopGroup = NioEventLoopGroup()
     val workerGroup: EventLoopGroup = NioEventLoopGroup()
 
@@ -345,7 +349,6 @@ fun main() {
 
                     override fun initChannel(ch: SocketChannel) {
                         ch.pipeline()
-//                                .addLast(LoggingHandler())
                                 .addLast(Receiver())
                                 .addLast(RtspDecoder())
                                 .addLast(HttpObjectAggregator(4 * 1024))
@@ -357,7 +360,7 @@ fun main() {
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
 
         // Bind and start to accept incoming connections.
-        val f: ChannelFuture = b.bind(12345).sync()
+        val f: ChannelFuture = b.bind(port).sync()
 
         // Wait until the server socket is closed.
         // In this example, this does not happen, but you can do that to gracefully
