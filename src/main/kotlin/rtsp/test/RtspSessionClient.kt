@@ -1,8 +1,5 @@
-package rsp.test
+package rtsp.test
 
-import assertk.assertThat
-import assertk.assertions.isNull
-import assertk.catch
 import io.netty.bootstrap.Bootstrap
 import io.netty.channel.*
 import io.netty.channel.nio.NioEventLoopGroup
@@ -13,55 +10,14 @@ import io.netty.handler.codec.rtsp.*
 import io.netty.handler.logging.LogLevel
 import io.netty.handler.logging.LoggingHandler
 import mu.KotlinLogging
-import org.spekframework.spek2.Spek
-import org.spekframework.spek2.lifecycle.CachingMode
-import org.spekframework.spek2.style.specification.describe
-import rtsp.test.runServer
-import java.io.*
+import java.io.BufferedInputStream
+import java.io.Closeable
+import java.io.InputStream
 import java.nio.charset.Charset
 import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
-
-
-object ServerSpec : Spek({
-    describe("RECORD flow") {
-        val server = Thread { runServer(8888) }.also { it.start() }
-
-        val client by memoized(CachingMode.EACH_GROUP) { RtspSessionClient("localhost", 8888, "/test") }
-
-        afterGroup {
-            server.interrupt()
-            client.close()
-        }
-
-        it("should run OPTIONS") {
-            assertThat(catch { client.options().get() }).isNull()
-        }
-
-        it("should announce the content") {
-            assertThat(catch { client.announce("test track", "L8/44100/1", 96, 0).get() }).isNull()
-        }
-
-        it("should setup the session") {
-            assertThat(catch { client.setup("record", 0, 1).get() }).isNull()
-        }
-
-        it("should initiate record of the session") {
-            assertThat(catch { client.record().get() }).isNull()
-        }
-
-        it("should stream data") {
-            val s = "1234567890abcdefghijklmnopqrstuvwxyz"
-            assertThat(catch { client.streamData(96, 0, ByteArrayInputStream(s.toByteArray())) }).isNull()
-        }
-
-        it("should tear down the session") {
-            assertThat(catch { client.tearDown().get() }).isNull()
-        }
-    }
-})
 
 class RtspSessionClient(
         private val host: String,
@@ -82,7 +38,7 @@ class RtspSessionClient(
     private val client = client()
     private val uri = "rtsp://$host:$port$path"
 
-    private val sessionId = Random.nextInt(Int.MAX_VALUE)
+    private var sessionId: String? = null
     private val cseq = AtomicInteger(1)
     private val streamCounter = AtomicInteger(Random.nextInt(Int.MAX_VALUE / 4))
 
@@ -128,7 +84,6 @@ class RtspSessionClient(
         )
         request.headers()
                 .add(RtspHeaderNames.CSEQ, cseq.getAndIncrement())
-                .add(RtspHeaderNames.SESSION, sessionId)
                 .add(HttpHeaderNames.CONTENT_TYPE, "application/sdp")
                 .add(HttpHeaderNames.CONTENT_LENGTH, contentLength)
         return doRequest<FullHttpResponse, Unit>(request) {
@@ -136,7 +91,9 @@ class RtspSessionClient(
         }
     }
 
-    fun setup(mode: String, dataPort: Int, managePort: Int): Future<Unit> {
+    fun setup(mode: String, dataPort: Int): Future<Unit> {
+        require(dataPort % 2 == 0) { "Data port $dataPort should be even" }
+        val managePort = dataPort + 1
         val request = DefaultFullHttpRequest(
                 RtspVersions.RTSP_1_0,
                 RtspMethods.SETUP,
@@ -144,10 +101,10 @@ class RtspSessionClient(
         )
         request.headers()
                 .add(RtspHeaderNames.CSEQ, cseq.getAndIncrement())
-                .add(RtspHeaderNames.SESSION, sessionId)
                 .add(RtspHeaderNames.TRANSPORT, "RTP/AVP/TCP;unicast;mode=$mode;interleaved=$dataPort-$managePort")
         return doRequest<FullHttpResponse, Unit>(request) {
             log.info { "SETUP request resulted with $it" }
+            sessionId = it.headers()[RtspHeaderNames.SESSION]
         }
     }
 
@@ -159,7 +116,7 @@ class RtspSessionClient(
         )
         request.headers()
                 .add(RtspHeaderNames.CSEQ, cseq.getAndIncrement())
-                .add(RtspHeaderNames.SESSION, sessionId)
+                .add(RtspHeaderNames.SESSION, sessionId!!)
         return doRequest<FullHttpResponse, Unit>(request) {
             log.info { "RECORD request resulted with $it" }
         }
@@ -183,6 +140,11 @@ class RtspSessionClient(
                 (0 shl 7) or // marker
                         (formatId and 0x7F) // payload type
                 ).toByte()
+        val ssrc = sessionId.hashCode()
+        rtpHeader[8] = (ssrc ushr 24 and 0xFF).toByte()
+        rtpHeader[9] = (ssrc ushr 16 and 0xFF).toByte()
+        rtpHeader[10] = (ssrc ushr 8 and 0xFF).toByte()
+        rtpHeader[11] = (ssrc and 0xFF).toByte()
         BufferedInputStream(stream).use { reader ->
             val bytesRead = reader.read(b)
             val contentSize = bytesRead + rtpHeaderSize
@@ -196,11 +158,6 @@ class RtspSessionClient(
             rtpHeader[5] = (timestamp ushr 16 and 0xFF).toByte()
             rtpHeader[6] = (timestamp ushr 8 and 0xFF).toByte()
             rtpHeader[7] = (timestamp and 0xFF).toByte()
-            val ssrc = sessionId
-            rtpHeader[8] = (ssrc ushr 24 and 0xFF).toByte()
-            rtpHeader[9] = (ssrc ushr 16 and 0xFF).toByte()
-            rtpHeader[10] = (ssrc ushr 8 and 0xFF).toByte()
-            rtpHeader[11] = (ssrc and 0xFF).toByte()
 
             buf.writeBytes(packetHeader)
             buf.writeBytes(rtpHeader)
@@ -263,7 +220,7 @@ class RtspSessionClient(
             @Throws(Exception::class)
             override fun initChannel(ch: SocketChannel) {
                 ch.pipeline()
-                        .addLast(LoggingHandler(LogLevel.INFO))
+                        .addLast(LoggingHandler(RtspSessionClient::class.java, LogLevel.TRACE))
                         .addLast(RtspEncoder())
                         .addLast(RtspDecoder())
                         .addLast(HttpObjectAggregator(4 * 1024))
@@ -275,4 +232,3 @@ class RtspSessionClient(
         return b.connect(host, port).sync().channel()
     }
 }
-
